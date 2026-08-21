@@ -585,7 +585,8 @@ function _cbf_prepare_layout(con::Vector{Tuple{String,Int}}, var::Vector{Tuple{S
     end
     @assert eq_ptr == number_eq + 1
     @assert ineq_ptr == number_eq + number_ineq + 1
-    @assert soc_ptr == total_rows + 1
+    @assert soc_ptr == number_eq + number_ineq + number_soc_rows + 1
+    @assert exp_ptr == total_rows + 1
 
     number_soc_vars = 0
     for (cone_type, len) in var
@@ -628,16 +629,18 @@ function _cbf_prepare_layout(con::Vector{Tuple{String,Int}}, var::Vector{Tuple{S
     @assert linear_ptr == number_lu_x + 1
     @assert soc_var_ptr == n + 1
 
-    SOC_con_idx = Int[number_eq+number_ineq+1]
+    SOC_con_idx = number_soc_rows > 0 ? Int[number_eq+number_ineq+1] : Int[]
     for len in soc_con_lens
         push!(SOC_con_idx, SOC_con_idx[end] + len)
     end
-    EXP_con_idx = number_eq + number_ineq + number_soc_rows > 0 ?
+    EXP_con_idx = number_exp_rows > 0 ?
         Int[number_eq + number_ineq + number_soc_rows + 1] : Int[]
     for len in exp_con_lens
         push!(EXP_con_idx, EXP_con_idx[end] + len)
     end
-    @assert SOC_con_idx[end] - 1 == number_eq + number_ineq + number_soc_rows
+    if !isempty(SOC_con_idx)
+        @assert SOC_con_idx[end] - 1 == number_eq + number_ineq + number_soc_rows
+    end
     if !isempty(EXP_con_idx)
         @assert EXP_con_idx[end] - 1 == total_rows
     end
@@ -1158,6 +1161,21 @@ function _read_cbf_io(filename::String)
         obj_constant *= -1
     end
 
+    # ---- EXP cone y >= 0 fix (CBF: EP implies y >= 0, but our parser treats EP as FR) ----
+    if !isempty(EXP_con_idx)
+        for k in 1:(length(EXP_con_idx) - 1)
+            rs = EXP_con_idx[k]
+            y_row = rs + 1
+            nzidx, _ = findnz(A_new[y_row, :])
+            if !isempty(nzidx)
+                y_var = Int(nzidx[1])
+                if lb[y_var] < 0.0
+                    lb[y_var] = 0.0
+                end
+            end
+        end
+    end
+
     return spzeros(Float64, n, n), c, SparseMatrixCSC{Float64,Int32}(A_new), b_new,
            SOC_con_idx, EXP_con_idx, number_eq, number_ineq, lb, ub, SOC_var_idx, obj_constant
 end
@@ -1462,6 +1480,21 @@ function _read_cbf_mmap(data::Vector{UInt8})
     if sense == "max"
         c .*= -1
         obj_constant *= -1
+    end
+
+    # ---- EXP cone y >= 0 fix (CBF: EP implies y >= 0, but our parser treats EP as FR) ----
+    if !isempty(EXP_con_idx)
+        for k in 1:(length(EXP_con_idx) - 1)
+            rs = EXP_con_idx[k]
+            y_row = rs + 1
+            nzidx, _ = findnz(A_new[y_row, :])
+            if !isempty(nzidx)
+                y_var = Int(nzidx[1])
+                if lb[y_var] < 0.0
+                    lb[y_var] = 0.0
+                end
+            end
+        end
     end
 
     return spzeros(Float64, n, n), c, SparseMatrixCSC{Float64,Int32}(A_new), b_new,
