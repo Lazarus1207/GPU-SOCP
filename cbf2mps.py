@@ -300,6 +300,14 @@ def translate(m, relax_int):
     lo = [0.0] * n_orig
     up = [INF] * n_orig
 
+    # Bucket A by row ONCE.  Scanning the whole sparse matrix per constraint
+    # row is O(n_con * nnz) and dominates every other cost on large models.
+    A_by_row = defaultdict(dict)
+    for (rr, cc), v in m.A.items():
+        if v != 0.0:
+            row_d = A_by_row[rr]
+            row_d[cc] = row_d.get(cc, 0.0) + v
+
     # --- variable-side cones: bounds -------------------------------------
     for cone, dim, start in m.var_blocks:
         if cone == C_FREE:
@@ -346,10 +354,7 @@ def translate(m, relax_int):
                 sense = "G"
             else:                       # C_LNEG
                 sense = "L"
-            coeffs = {}
-            for (rr, cc), v in m.A.items():
-                if rr == grow and v != 0.0:
-                    coeffs[cc] = coeffs.get(cc, 0.0) + v
+            coeffs = dict(A_by_row.get(grow, ()))
             lin_rows.append(LinRow("R%d" % len(lin_rows), sense, coeffs,
                                    -m.b.get(grow, 0.0)))
 
@@ -367,10 +372,8 @@ def translate(m, relax_int):
             y_of_row[start + j] = yvars[j]
         for k in range(dim):
             grow = start + k
-            coeffs = {yvars[k]: -1.0}
-            for (rr, cc), v in m.A.items():
-                if rr == grow and v != 0.0:
-                    coeffs[cc] = coeffs.get(cc, 0.0) + v
+            coeffs = dict(A_by_row.get(grow, ()))
+            coeffs[yvars[k]] = coeffs.get(yvars[k], 0.0) - 1.0
             lin_rows.append(LinRow("R%d" % len(lin_rows), "E", coeffs,
                                    -m.b.get(grow, 0.0)))
         if cone == C_SOC:
@@ -533,8 +536,6 @@ def verify_mps(path, verbose=True):
                     cols_order.append(var)
                 if row != "OBJ":
                     entries[row].append((var, val))
-                if len(t) >= 5:
-                    var2, row2, val2 = t[3], t[4], float(t[5] if len(t) > 5 else 0)
             elif section == "RHS":
                 rhs[t[1]] = float(t[2])
             elif section == "BOUNDS":
