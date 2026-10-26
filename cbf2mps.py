@@ -89,20 +89,34 @@ def fmt(v):
 # line reader that skips blanks and '#' comments
 # ----------------------------------------------------------------------------
 class Reader(object):
-    def __init__(self, text):
-        self._lines = text.splitlines()
+    """Line iterator that skips blanks and '#' comments.
+
+    Streaming, so the decompressed CBF never has to be materialised as one
+    string plus a full list of line strings.
+    """
+
+    def __init__(self, lines):
+        self._it = lines
         self._i = 0
+        self._pending = None
 
     def next(self, what=""):
-        while self._i < len(self._lines):
-            s = self._lines[self._i].strip()
-            self._i += 1
+        if self._pending is not None:
+            s, self._pending = self._pending, None
+            return s
+        for raw in self._it:
+            s = raw.strip()
             if not s or s.startswith("#"):
                 continue
+            self._i += 1
             return s
         if what:
             raise CbfError("unexpected end of file while reading %s" % what)
         return None
+
+    def push(self, line):
+        """Give the last-returned line back (used for keyword peek)."""
+        self._pending = line
 
     def count(self, what):
         tok = self.next(what).split()
@@ -137,8 +151,11 @@ class Model(object):
 # ----------------------------------------------------------------------------
 # CBF parser
 # ----------------------------------------------------------------------------
-def parse_cbf(text, path="<cbf>"):
-    r = Reader(text)
+def parse_cbf(lines, path="<cbf>"):
+    # Accept a pre-read string as well, so older callers keep working.
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    r = Reader(lines)
     m = Model()
     m.name = os.path.basename(path).split(".")[0][:60] or "cbf"
 
@@ -409,6 +426,46 @@ def translate(m, relax_int):
 # ----------------------------------------------------------------------------
 # MPS writer
 # ----------------------------------------------------------------------------
+CHUNK_LINES = 400000
+
+
+class _LineSink:
+    """Buffered line writer: keeps memory flat regardless of problem size.
+
+    The previous implementation accumulated every MPS line in one Python list
+    and joined it at the end, which costs tens of GB on large instances.
+    """
+
+    __slots__ = ("_fh", "_buf", "_w")
+
+    def __init__(self, fh):
+        self._fh = fh
+        self._buf = []
+        self._w = self._buf.append
+
+    def __call__(self, line):
+        self._w(line)
+        if len(self._buf) >= CHUNK_LINES:
+            self.flush()
+
+    def flush(self):
+        if self._buf:
+            self._fh.write("\n".join(self._buf))
+            self._fh.write("\n")
+            del self._buf[:]
+
+
+def _open_mps_out(path):
+    """Open the destination for writing, transparently gzipping if path ends .gz.
+
+    cuopt_cli reads .mps.gz natively, so writing gzip lets the pipeline hold a
+    fraction of the uncompressed footprint on disk.
+    """
+    if path.endswith(".gz"):
+        return gzip.open(path, "wt", compresslevel=6, newline="\n")
+    return open(path, "w", newline="\n")
+
+
 def write_mps(path, m, lo, up, lin_rows, quad_rows, ncols, integer):
     # column order: integer block first (contiguous, required by the parser),
     # then the continuous ones.  Names stay tied to their CBF index.
@@ -427,8 +484,8 @@ def write_mps(path, m, lo, up, lin_rows, quad_rows, ncols, integer):
             if v != 0.0:
                 col_entries[c].append((r.name, v))
 
-    out = []
-    w = out.append
+    fh = _open_mps_out(path)
+    w = _LineSink(fh)
     w("NAME          %s" % m.name)
     if m.maximize:
         w("OBJSENSE")
@@ -487,10 +544,8 @@ def write_mps(path, m, lo, up, lin_rows, quad_rows, ncols, integer):
                 w("    %s  %s  %s" % (name(i), name(j), fmt(v)))
 
     w("ENDATA")
-
-    with open(path, "w") as fh:
-        fh.write("\n".join(out))
-        fh.write("\n")
+    w.flush()
+    fh.close()
 
 
 # ----------------------------------------------------------------------------
@@ -508,7 +563,11 @@ def verify_mps(path, verbose=True):
     section = None
     qc_cur = None
 
-    with open(path) as fh:
+    if path.endswith(".gz"):
+        fh = gzip.open(path, "rt")
+    else:
+        fh = open(path)
+    with fh:
         for raw in fh:
             line = raw.rstrip("\n")
             if not line.strip() or line.lstrip().startswith("*"):
@@ -657,6 +716,7 @@ def verify_mps(path, verbose=True):
 # driver
 # ----------------------------------------------------------------------------
 def read_text(path):
+    """Legacy helper: read the whole file as text (memory-hungry, kept for tests)."""
     if path.endswith(".gz"):
         with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
             return fh.read()
@@ -664,8 +724,23 @@ def read_text(path):
         return fh.read()
 
 
+def iter_lines(path):
+    """Yield decoded lines lazily, decompressing on the fly for .gz inputs.
+
+    Streaming keeps peak memory tied to the model size rather than to the
+    size of the decompressed CBF text.
+    """
+    if path.endswith(".gz"):
+        fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        fh = open(path, "rt", encoding="utf-8", errors="replace")
+    with fh:
+        for line in fh:
+            yield line
+
+
 def convert_one(src, dst, relax_int, do_verify):
-    m = parse_cbf(read_text(src), src)
+    m = parse_cbf(iter_lines(src), src)
     lo, up, lin_rows, quad_rows, ncols, integer = translate(m, relax_int)
     write_mps(dst, m, lo, up, lin_rows, quad_rows, ncols, integer)
 
@@ -689,10 +764,14 @@ def convert_one(src, dst, relax_int, do_verify):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Convert MOSEK CBF (.cbf / .cbf.gz) to cuOpt-compatible MPS.")
+        description="Convert MOSEK CBF (.cbf / .cbf.gz) to cuOpt-compatible MPS. "
+                    "Output is gzip-compressed (.mps.gz) by default; cuopt_cli "
+                    "reads .mps.gz natively.")
     ap.add_argument("inputs", nargs="+", help=".cbf or .cbf.gz files (globs ok)")
-    ap.add_argument("-o", "--output", help="output .mps (single input only)")
-    ap.add_argument("-d", "--outdir", help="output directory for batch mode")
+    ap.add_argument("-o", "--output",
+                    help="output file (single input only). Ends in .gz -> gzipped.")
+    ap.add_argument("-d", "--outdir",
+                    help="output directory for batch mode (default: alongside input)")
     ap.add_argument("--relax-int", action="store_true",
                     help="drop integrality (solve the continuous relaxation)")
     ap.add_argument("--verify", action="store_true",
@@ -720,7 +799,7 @@ def main(argv=None):
                 base = base[:-len(suf)]
         if base.endswith(".cbf"):
             base = base[:-4]
-        dst = args.output or os.path.join(args.outdir or "", base + ".mps")
+        dst = args.output or os.path.join(args.outdir or "", base + ".mps.gz")
         try:
             if not convert_one(src, dst, args.relax_int, args.verify):
                 failed += 1
